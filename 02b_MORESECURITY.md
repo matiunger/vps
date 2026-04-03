@@ -348,316 +348,188 @@ curl -k https://YOUR-PUBLIC-IP   # should fail or be blocked
 
 ---
 
-## Part 3: GitHub Actions Deployment (Pull Model)
+## Part 3: Updating GitHub Actions for Tailscale
 
-After locking SSH to Tailscale-only, GitHub Actions runners can no longer SSH into your server — they're external machines with no Tailscale access.
+The workflows in `04c_WEB_SERVER_NEXTJS.md` use direct SSH (`ssh-agent` + `rsync`) to deploy. Since SSH is now locked to Tailscale, GitHub Actions runners — which are external machines — can no longer reach your server.
 
-The solution is to **flip the direction**: instead of GitHub pushing to your server, your server pulls from GitHub. The server listens for a webhook notification, then runs `git pull` itself. No inbound SSH needed from GitHub at all.
+The fix is the official **Tailscale GitHub Action**, which connects the runner to your Tailscale network before the SSH step. The rest of the workflow stays the same.
+
+
+
+---
+
+### Step 1 — Create an ACL Tag for GitHub Actions
+
+In the Tailscale admin panel → **Access Controls**, add a tag for GitHub runners:
+
+```json
+"tagOwners": {
+		"tag:github-actions": [],
+		"tag:munger-vps":     [],
+	},
+
+"grants": [
+		// Allow all connections.
+		// Comment this section out if you want to define specific restrictions.
+		{"src": ["*"], "dst": ["*"], "ip": ["*"]},
+		{
+			"src": ["tag:github-actions"],
+			"dst": ["tag:munger-vps"],
+			"ip":  ["*"],
+		},
+		// Allow users in "group:example" to access "tag:example", but only from
+		// devices that are running macOS and have enabled Tailscale client auto-updating.
+		// {"src": ["group:example"], "dst": ["tag:example"], "ip": ["*"], "srcPosture":["posture:autoUpdateMac"]},
+	],
+
+"ssh": [
+		// Allow all users to SSH into their own devices in check mode.
+		// Comment this section out if you want to define specific restrictions.
+		{
+			"action": "check",
+			"src":    ["autogroup:member"],
+			"dst":    ["autogroup:self"],
+			"users":  ["autogroup:nonroot", "root"],
+		},
+		{
+			"action": "accept",
+			"src":    ["autogroup:admin"],
+			"dst":    ["tag:munger-vps"],
+			"users":  ["autogroup:nonroot", "root"],
+		},
+		{
+			"action": "accept",
+			"src":    ["tag:github-actions"],
+			"dst":    ["tag:munger-vps"],
+			"users":  ["autogroup:nonroot", "root"],
+		},
+	],
+```
+
+This scopes the OAuth client to ephemeral devices (the runner joins Tailscale temporarily for each deploy and then disappears).
+
+---
+
+### Step 2 — Create a Tailscale OAuth Client
+
+1. Go to [tailscale.com/admin/settings/oauth](https://login.tailscale.com/admin/settings/oauth)
+2. Click **Generate OAuth client**
+3. Under **Scopes**,select:
+  **Devices → Write** (Select tag)
+  **Auth Keys  → Write** (Select tag)
+4. Copy the **Client ID** and **Client Secret**
+
+---
+
+### Step 3 — Add GitHub Secrets
+
+In your GitHub repo → **Settings** → **Secrets and variables** → **Actions**, add:
+
+| Secret | Value |
+|---|---|
+| `TAILSCALE_OAUTH_CLIENT_ID` | OAuth client ID from Step 2 |
+| `TAILSCALE_OAUTH_SECRET` | OAuth secret from Step 2 |
+| `SERVER_IP` | **Update the value** to your server's Tailscale IP (`100.x.x.x`) |
+| `SERVER_USER` | `deployer` |
+| `SSH_PRIVATE_KEY` | Your deploy SSH private key |
+
+Just update the value of the existing `SERVER_IP` secret — no need to rename it or change the workflow references.
+
+---
+
+### Step 4 — Update the Workflow
+
+Replace the workflow from `04c_WEB_SERVER_NEXTJS.md` with this updated version. The only change from the original is the **Connect to Tailscale** step — everything else stays the same:
+
+```yaml
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build application
+      run: npm run build
+
+    - name: Connect to Tailscale
+      uses: tailscale/github-action@v4
+      with:
+        oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+        oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+        tags: tag:github-actions
+        version: latest
+
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.9.1
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Add server to known hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to server
+      run: |
+        rsync -avz --delete \
+          --exclude 'node_modules' \
+          --exclude '.env.local' \
+          --exclude '.git' \
+          --exclude '.next/cache' \
+          -e "ssh" \
+          ./ \
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/myapp/
+
+        ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} << 'EOF'
+          cd /var/www/myapp
+          npm ci --production
+          pm2 restart myapp
+        EOF
+
+        echo "Deployment complete!"
+```
+
+For a second app, do the same — reuse the same `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_SECRET`, and `SERVER_IP` secrets, just change the rsync target path and pm2 app name.
 
 ---
 
 ### How It Works
 
 ```
-GitHub push → GitHub sends webhook → your server receives it → server runs git pull + restart
+git push → GitHub runner starts → runner joins Tailscale network
+→ runner SSHes to server via Tailscale IP → rsync + pm2 restart
+→ runner leaves Tailscale (ephemeral device, auto-removed)
 ```
 
-The webhook is a plain HTTPS POST to a small script running on your server. Since it goes through Cloudflare on port 443, it's already covered by your existing firewall setup.
-
----
-
-### Step 1 — Create the Webhook Script
-
-This is a small Node.js script that listens for GitHub webhook events and runs your deploy commands.
-
-Create the file:
-
-```bash
-mkdir -p /home/deployer/tools
-nano /home/deployer/tools/webhook.js
-```
-
-Paste the following:
-
-```js
-import http from 'http'
-import crypto from 'crypto'
-import { execSync } from 'child_process'
-
-const SECRET = process.env.WEBHOOK_SECRET
-const PORT = process.env.WEBHOOK_PORT || 9000
-
-// Map of repo name → deploy command
-const DEPLOY_COMMANDS = {
-  'yourrepo': 'cd /home/deployer/apps/public/yourdomain.com && git pull && npm install --production && pm2 restart yourdomain',
-  'another-repo': 'cd /home/deployer/apps/public/anotherdomain.com && git pull && pm2 restart anotherdomain',
-}
-
-function verifySignature(payload, signature) {
-  const hmac = crypto.createHmac('sha256', SECRET)
-  const digest = 'sha256=' + hmac.update(payload).digest('hex')
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature))
-}
-
-const server = http.createServer((req, res) => {
-  if (req.method !== 'POST' || req.url !== '/webhook') {
-    res.writeHead(404)
-    res.end()
-    return
-  }
-
-  let body = ''
-  req.on('data', chunk => body += chunk)
-  req.on('end', () => {
-    const signature = req.headers['x-hub-signature-256']
-
-    if (!signature || !verifySignature(body, signature)) {
-      console.log('Invalid signature — rejected')
-      res.writeHead(401)
-      res.end('Unauthorized')
-      return
-    }
-
-    const event = req.headers['x-github-event']
-    if (event !== 'push') {
-      res.writeHead(200)
-      res.end('Ignored')
-      return
-    }
-
-    const payload = JSON.parse(body)
-    const branch = payload.ref  // e.g. "refs/heads/main"
-    const repo = payload.repository.name
-
-    // Only deploy on pushes to main
-    if (branch !== 'refs/heads/main') {
-      res.writeHead(200)
-      res.end('Not main branch, ignored')
-      return
-    }
-
-    const cmd = DEPLOY_COMMANDS[repo]
-    if (!cmd) {
-      res.writeHead(200)
-      res.end('No deploy configured for this repo')
-      return
-    }
-
-    console.log(`Deploying ${repo}...`)
-    res.writeHead(200)
-    res.end('Deploying')
-
-    try {
-      execSync(cmd, { stdio: 'inherit' })
-      console.log(`Deployed ${repo} successfully`)
-    } catch (err) {
-      console.error(`Deploy failed for ${repo}:`, err.message)
-    }
-  })
-})
-
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Webhook server listening on port ${PORT}`)
-})
-```
-
-> The server binds to `127.0.0.1` (localhost only) — it's never exposed directly to the internet. Nginx proxies to it.
-
----
-
-### Step 2 — Configure the Deploy Commands
-
-Edit `DEPLOY_COMMANDS` at the top of the script to match your repos and apps:
-
-```js
-const DEPLOY_COMMANDS = {
-  'my-site': 'cd /home/deployer/apps/public/mysite.com && git pull && pm2 restart mysite',
-  'my-nextjs-app': 'cd /home/deployer/apps/public/nextjs.com && git pull && npm install --production && npm run build && pm2 restart nextjs',
-}
-```
-
-The key is the **GitHub repository name** (not the full URL, just the name after the `/`).
-
----
-
-### Step 3 — Create a Webhook Secret
-
-Generate a strong random secret:
-
-```bash
-openssl rand -hex 32
-```
-
-Copy the output. Store it in your secrets file:
-
-```bash
-nano /home/deployer/secrets/webhook.env
-```
-
-```
-WEBHOOK_SECRET=your_generated_secret_here
-WEBHOOK_PORT=9000
-```
-
-```bash
-chmod 600 /home/deployer/secrets/webhook.env
-```
-
----
-
-### Step 4 — Run the Webhook Server with PM2
-
-```bash
-cd /home/deployer/tools
-pm2 start webhook.js --name webhook --env-file /home/deployer/secrets/webhook.env
-pm2 save
-```
-
-Verify it's running:
-
-```bash
-pm2 status
-pm2 logs webhook
-```
-
----
-
-### Step 5 — Expose the Webhook via Nginx
-
-Add a location block to your nginx config so the webhook is reachable at `https://yourdomain.com/webhook`. You can add this to any existing site config, or create a dedicated one.
-
-Edit the relevant file in `/etc/nginx/sites-available/`:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name yourdomain.com;
-
-    # ... your existing SSL and site config ...
-
-    location /webhook {
-        proxy_pass http://127.0.0.1:9000/webhook;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 30s;
-    }
-}
-```
-
-Test and reload nginx:
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
----
-
-### Step 6 — Add the Webhook in GitHub
-
-For each repository:
-
-1. Go to your repo → **Settings** → **Webhooks** → **Add webhook**
-2. **Payload URL:** `https://yourdomain.com/webhook`
-3. **Content type:** `application/json`
-4. **Secret:** paste the secret you generated in Step 3
-5. **Which events:** select **Just the push event**
-6. Click **Add webhook**
-
-GitHub will send a test ping — check `pm2 logs webhook` to confirm it was received.
-
----
-
-### Step 7 — Make Sure the Server Can Pull from GitHub
-
-The server needs read access to your repos. Since you don't want to store SSH keys in the repo, use a **GitHub deploy key** — a read-only SSH key scoped to a single repository.
-
-On your server, generate a deploy key:
-
-```bash
-ssh-keygen -t ed25519 -C "deploy@yourserver" -f /home/deployer/.ssh/deploy_key -N ""
-```
-
-Copy the public key:
-
-```bash
-cat /home/deployer/.ssh/deploy_key.pub
-```
-
-In GitHub: repo → **Settings** → **Deploy keys** → **Add deploy key** → paste the public key. Leave "Allow write access" unchecked.
-
-Configure SSH to use this key for GitHub:
-
-```bash
-nano /home/deployer/.ssh/config
-```
-
-```
-Host github.com
-    IdentityFile /home/deployer/.ssh/deploy_key
-    IdentitiesOnly yes
-```
-
-Test it:
-
-```bash
-ssh -T git@github.com
-# Should say: Hi yourrepo! You've successfully authenticated...
-```
-
-Make sure your repo remote uses SSH (not HTTPS):
-
-```bash
-cd /home/deployer/apps/public/yourdomain.com
-git remote -v
-# Should show: git@github.com:yourusername/yourrepo.git
-
-# If it shows https://, switch it:
-git remote set-url origin git@github.com:yourusername/yourrepo.git
-```
-
----
-
-### How to Deploy
-
-Push to `main` on GitHub. The webhook fires, the server pulls, restarts. Done.
-
-```bash
-# On your local machine:
-git push origin main
-# → GitHub notifies your server
-# → server runs git pull + pm2 restart
-# → site is updated within seconds
-```
-
-To deploy a staging branch, add a second location and PM2 process pointing at `refs/heads/staging`.
+The runner is only on your Tailscale network for the duration of the deploy. It's automatically removed afterwards — no permanent devices accumulate in your Tailscale admin.
 
 ---
 
 ### Troubleshooting
 
 ```bash
-# Watch webhook logs in real time
-pm2 logs webhook
+# Verify the runner connected (check Tailscale admin during a deploy run)
+# You should see a device like "github-runner-xxxxx" appear temporarily
 
-# Test the webhook manually (replace with your secret)
-curl -X POST https://yourdomain.com/webhook \
-  -H "Content-Type: application/json" \
-  -H "X-GitHub-Event: push" \
-  -H "X-Hub-Signature-256: sha256=INVALID" \
-  -d '{}'
-# Should return 401 Unauthorized (signature check working)
-
-# Check GitHub delivery logs
-# GitHub repo → Settings → Webhooks → your webhook → Recent Deliveries
-# Shows exact payload sent and your server's response
+# If SSH times out, confirm the Tailscale step succeeded in the Actions log
+# and that SERVER_IP matches your server's 100.x.x.x address
+tailscale status  # run on server to confirm its Tailscale IP
 ```
-
----
-
-## Ongoing Maintenance
-
-- **Tailscale** — updates itself automatically. Check `tailscale status` occasionally.
-- **Cloudflare IPs** — check [cloudflare.com/ips](https://www.cloudflare.com/ips/) a few times a year and update UFW rules if the ranges change.
-- **SSL certs** — certbot auto-renews via a systemd timer. Verify with `sudo certbot renew --dry-run`.
-- **Webhook server** — runs under PM2, restarts automatically on crash and on server reboot (after `pm2 save`).
