@@ -228,25 +228,49 @@ Certbot automatically sets up a cron job to renew certificates. They expire ever
 
 Complete walkthrough for setting up a new website from scratch, using a simple HTML example. We'll use **brewapps.poinglabs.com** as our example domain.
 
+**Summary Checklist:**
+
+- [ ] Create directory structure for production and dev sites
+- [ ] Set correct ownership and permissions (deployer user, 755)
+- [ ] Create simple HTML files for each environment
+- [ ] Create nginx configuration files for each site
+- [ ] Enable sites by creating symlinks in sites-enabled
+- [ ] Set up DNS A records for domains
+- [ ] Get SSL certificates with Certbot
+- [ ] Test both sites in browser
+
 ### Step 1: Create the Directory Structure
 
-**Important:** Use generic folder names that don't include the domain. This way you can change domains later without renaming folders.
+**Important:** Use a project-based folder structure with `prod` and `stage` subfolders. This keeps all environments organized under one project folder.
 
 ```bash
-# Create directory for the production site
-sudo mkdir -p /var/www/brewapps/html
-
-# Create directory for the dev site  
-sudo mkdir -p /var/www/brewapps-dev/html
+# Create project folder structure
+# brewapps = project name (not domain-specific)
+sudo mkdir -p /var/www/brewapps/prod/html
+sudo mkdir -p /var/www/brewapps/stage/html
 
 # Set ownership to deployer user (or your user)
 sudo chown -R deployer:deployer /var/www/brewapps
-sudo chown -R deployer:deployer /var/www/brewapps-dev
 
 # Set correct permissions
 sudo chmod -R 755 /var/www/brewapps
-sudo chmod -R 755 /var/www/brewapps-dev
 ```
+
+**New Folder Structure:**
+```
+/var/www/
+└── brewapps/              # Project folder (generic name)
+    ├── prod/              # Production environment
+    │   └── html/          # Production website files
+    └── stage/             # Staging/development environment
+        └── html/          # Staging website files
+```
+
+**Benefits of this structure:**
+- All environments in one place
+- Easy to find and manage
+- Can add more environments later (test, demo, etc.)
+- Domain changes only require nginx config updates
 
 **Why Ownership and Permissions Matter:**
 
@@ -336,41 +360,45 @@ find /var/www/brewapps/html -type f -exec chmod 644 {} \;
 
 **Why generic names?**
 
-The folder structure is `/var/www/brewapps/html/` rather than just `/var/www/brewapps/`. Here's why:
+The folder structure uses a project-based approach with environment subfolders. Here's why:
 
-1. **Convention**: Follows the traditional web server directory structure (Apache started this)
-2. **Organization**: The parent folder (`brewapps`) can hold other files like:
-   - Configuration files
-   - Logs
-   - Backups
-   - Scripts
-   - While `html/` contains only the publicly accessible web files
-3. **Security**: If you accidentally put sensitive files in the parent folder, they won't be served to visitors
-4. **Nginx `root` directive**: Tells nginx "look here for files to serve" - typically set to the `html` folder
+1. **Organization**: One project folder contains all environments:
+   - `prod/` - Production files
+   - `stage/` - Staging/development files
+   - Easy to add `test/`, `demo/`, etc. later
+2. **Convention**: Each environment has an `html/` subfolder for publicly accessible files
+3. **Security**: Parent folders can hold private files (logs, configs) that won't be served
+4. **Nginx `root` directive**: Points to the `html` folder for each environment
 
 **Example structure:**
 ```
-/var/www/brewapps/
-├── html/              # Only this is publicly accessible
-│   ├── index.html     # Homepage
-│   ├── css/
-│   ├── js/
-│   └── images/
-├── logs/              # App-specific logs
-├── config/            # Private config files
-└── backups/           # Database backups
+/var/www/brewapps/           # Project folder
+├── prod/                    # Production environment
+│   ├── html/               # Public files (root for nginx)
+│   │   ├── index.html
+│   │   ├── css/
+│   │   └── js/
+│   ├── logs/               # Production logs
+│   └── config/             # Production configs
+└── stage/                   # Staging environment
+    ├── html/               # Public files (root for nginx)
+    │   ├── index.html
+    │   ├── css/
+    │   └── js/
+    └── logs/               # Staging logs
 ```
 
-**Why generic names?**
-- If you change from `brewapps.poinglabs.com` to `brewapps.com`, you only update the nginx config
-- No need to move files or rename directories
-- Domain mapping happens in nginx, not folder names
+**Why this structure?**
+- All environments organized in one place
+- Easy domain changes (just update nginx `server_name`)
+- Can add environments without cluttering `/var/www/`
+- Consistent naming across all projects
 
 ### Step 2: Create a Simple HTML File
 
 ```bash
 # Create index.html for production
-cat > /var/www/brewapps/html/index.html << 'EOF'
+cat > /var/www/brewapps/prod/html/index.html << 'EOF'
 <!DOCTYPE html>
 <html>
 <head>
@@ -398,12 +426,12 @@ cat > /var/www/brewapps/html/index.html << 'EOF'
 </html>
 EOF
 
-# Create index.html for dev
-cat > /var/www/brewapps-dev/html/index.html << 'EOF'
+# Create index.html for staging
+cat > /var/www/brewapps/stage/html/index.html << 'EOF'
 <!DOCTYPE html>
 <html>
 <head>
-    <title>BrewApps - Development</title>
+    <title>BrewApps - Staging</title>
     <style>
         body { 
             font-family: Arial, sans-serif; 
@@ -414,7 +442,7 @@ cat > /var/www/brewapps-dev/html/index.html << 'EOF'
         }
         h1 { font-size: 3em; margin-bottom: 20px; }
         .version { font-size: 1.5em; opacity: 0.9; }
-        .dev-badge {
+        .stage-badge {
             background: #ff6b6b;
             color: white;
             padding: 10px 20px;
@@ -426,8 +454,8 @@ cat > /var/www/brewapps-dev/html/index.html << 'EOF'
 </head>
 <body>
     <h1>Welcome to BrewApps!</h1>
-    <p class="version">Development Environment</p>
-    <div class="dev-badge">DEV MODE</div>
+    <p class="version">Staging Environment</p>
+    <div class="stage-badge">STAGE MODE</div>
     <p>Server time: <span id="time"></span></p>
     <script>
         document.getElementById('time').textContent = new Date().toLocaleString();
@@ -447,7 +475,7 @@ Nginx uses configuration files to tell it:
 **Production site config:**
 
 ```bash
-sudo nano /etc/nginx/sites-available/brewapps
+sudo nano /etc/nginx/sites-available/brewapps-prod
 ```
 
 ```nginx
@@ -461,8 +489,8 @@ server {
     server_name brewapps.poinglabs.com;
     
     # Where to find website files (the "root" of your site)
-    # Points to the html folder we created
-    root /var/www/brewapps/html;
+    # Points to the prod/html folder we created
+    root /var/www/brewapps/prod/html;
     
     # Default file to serve when someone visits the directory
     # Nginx looks for these in order: index.html, then index.htm
@@ -484,10 +512,10 @@ server {
 }
 ```
 
-**Dev site config:**
+**Staging site config:**
 
 ```bash
-sudo nano /etc/nginx/sites-available/brewapps-dev
+sudo nano /etc/nginx/sites-available/brewapps-stage
 ```
 
 ```nginx
@@ -495,11 +523,11 @@ server {
     listen 80;
     listen [::]:80;
     
-    # Different domain for dev environment
-    server_name dev.brewapps.poinglabs.com;
+    # Different domain for staging environment
+    server_name stage.brewapps.poinglabs.com;
     
-    # Different folder for dev files
-    root /var/www/brewapps-dev/html;
+    # Points to the stage/html folder
+    root /var/www/brewapps/stage/html;
     index index.html index.htm;
     
     location / {
@@ -519,7 +547,7 @@ server {
 |-----------|--------------|---------|
 | `listen 80` | Tells nginx to accept HTTP connections on port 80 | When someone types http://yoursite.com |
 | `server_name` | Which domain(s) this config applies to | `brewapps.poinglabs.com` |
-| `root` | Where website files are located | `/var/www/brewapps/html` |
+| `root` | Where website files are located | `/var/www/brewapps/prod/html` |
 | `index` | Default file to show when visiting a folder | `index.html` |
 | `location /` | Rules for all requests | Handles every URL |
 | `try_files` | What to try when someone requests a URL | File → Directory → 404 error |
@@ -534,10 +562,10 @@ User types: https://brewapps.poinglabs.com/about
 2. Browser → HTTP request to your server on port 80/443
 3. Nginx receives request
 4. Nginx checks: "Does server_name match brewapps.poinglabs.com?" ✓
-5. Nginx looks in root folder: /var/www/brewapps/html/
-6. Nginx looks for: /var/www/brewapps/html/about
+5. Nginx looks in root folder: /var/www/brewapps/prod/html/
+6. Nginx looks for: /var/www/brewapps/prod/html/about
    - If exists: serve it
-   - If not: try /var/www/brewapps/html/about/
+   - If not: try /var/www/brewapps/prod/html/about/
    - If neither: return 404 error
 7. Nginx sends file back to browser with security headers
 8. Browser displays the page
@@ -549,8 +577,8 @@ User types: https://brewapps.poinglabs.com/about
 
 ```bash
 # Create symlinks to enable sites
-sudo ln -s /etc/nginx/sites-available/brewapps /etc/nginx/sites-enabled/
-sudo ln -s /etc/nginx/sites-available/brewapps-dev /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/brewapps-prod /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/brewapps-stage /etc/nginx/sites-enabled/
 
 # Test nginx configuration
 sudo nginx -t
@@ -558,6 +586,32 @@ sudo nginx -t
 # Reload nginx to apply changes
 sudo systemctl reload nginx
 ```
+
+### Disable a Site
+
+To disable a site (temporarily take it offline without deleting the configuration):
+
+```bash
+# Remove the symlink from sites-enabled
+sudo rm /etc/nginx/sites-enabled/brewapps-stage
+
+# Test configuration
+sudo nginx -t
+
+# Reload nginx to apply changes
+sudo systemctl reload nginx
+```
+
+**What happens:**
+- The site becomes unavailable (visitors see default nginx page or 404)
+- The config file in `sites-available/` remains intact
+- You can re-enable later by recreating the symlink
+
+**When to disable:**
+- Maintenance mode
+- Temporary takedown
+- Troubleshooting issues
+- Before deleting a site permanently
 
 ### Step 5: Set Up DNS
 
@@ -571,7 +625,7 @@ In your domain registrar or DNS provider (wherever you manage poinglabs.com DNS)
    TTL: 3600
    
    Type: A
-   Name: dev.brewapps
+   Name: stage.brewapps
    Value: YOUR_SERVER_IP
    TTL: 3600
    ```
@@ -582,7 +636,7 @@ In your domain registrar or DNS provider (wherever you manage poinglabs.com DNS)
    ```bash
    # Check if DNS is working
    nslookup brewapps.poinglabs.com
-   nslookup dev.brewapps.poinglabs.com
+   nslookup stage.brewapps.poinglabs.com
    
    # Should return your server IP
    ```
@@ -593,8 +647,8 @@ In your domain registrar or DNS provider (wherever you manage poinglabs.com DNS)
 # Get certificate for production
 sudo certbot --nginx -d brewapps.poinglabs.com
 
-# Get certificate for dev
-sudo certbot --nginx -d dev.brewapps.poinglabs.com
+# Get certificate for staging
+sudo certbot --nginx -d stage.brewapps.poinglabs.com
 
 # Test auto-renewal
 sudo certbot renew --dry-run
@@ -610,7 +664,7 @@ sudo certbot renew --dry-run
 
 Open in browser:
 - https://brewapps.poinglabs.com (should show "Production Environment")
-- https://dev.brewapps.poinglabs.com (should show "Development Environment" with red badge)
+- https://stage.brewapps.poinglabs.com (should show "Staging Environment" with red badge)
 
 You now have two working sites with SSL!
 
@@ -622,13 +676,11 @@ Now let's set up automatic deployment when you push to specific branches.
 
 ### Step 1: Set Up SSH Keys for GitHub Actions
 
-**Method: Using Hetzner Console (Recommended)**
+**Method A: Manual Setup (For Deployer User)**
 
-Hetzner allows you to add multiple SSH keys to your server through the console. This is cleaner than manually editing files on the server.
+Since Hetzner Console only adds SSH keys for the root user, you'll need to manually add the key for the deployer user:
 
-**A. Generate SSH Key Pair**
-
-On your local machine (or any secure location):
+**1. Generate SSH Key Pair (on your local machine):**
 
 ```bash
 # Generate a new SSH key specifically for GitHub Actions
@@ -640,34 +692,58 @@ ssh-keygen -t ed25519 -C "github-actions@brewapps" -f ~/.ssh/github_actions_depl
 # ~/.ssh/github_actions_deploy.pub (public key - safe to share)
 ```
 
-**B. Add Public Key to Hetzner Console**
+**2. Add Public Key to Deployer User on Server:**
+
+SSH into your server as the deployer user, then:
+
+```bash
+# Create .ssh directory if it doesn't exist
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+# Add the public key to authorized_keys
+echo "ssh-ed25519 AAAAC3NzaC... github-actions@brewapps" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Replace the `ssh-ed25519 AAAAC3NzaC...` part with your actual public key from `~/.ssh/github_actions_deploy.pub`.
+
+**Alternative: Copy from your local machine:**
+
+```bash
+# On your local machine, copy the public key
+cat ~/.ssh/github_actions_deploy.pub | pbcopy  # macOS
+# or
+cat ~/.ssh/github_actions_deploy.pub  # Linux - copy manually
+
+# Then paste it into the server's ~/.ssh/authorized_keys file
+```
+
+**Method B: Using Hetzner Console (Root User Only)**
+
+If you prefer using the Hetzner Console (note: this only works for the root user):
 
 1. **Copy the public key:**
    ```bash
    cat ~/.ssh/github_actions_deploy.pub
-   # Copy the output (starts with ssh-ed25519...)
    ```
 
 2. **In Hetzner Cloud Console:**
    - Go to your Project
-   - Click **"Security"** in the left sidebar (or **"SSH Keys"**)
+   - Click **"Security"** → **"SSH Keys"**
    - Click **"Add SSH Key"**
    - **Name:** `github-actions-deploy`
-   - **Public Key:** Paste the key you copied
+   - **Public Key:** Paste the key
    - Click **"Add SSH Key"**
 
-3. **Attach Key to Your Server:**
-   - Go to your server
-   - Click **"Rescue"** tab or **"Rebuild"** (don't worry, we won't rebuild)
-   - OR: Power off and power on the server to apply the key
-   - Actually, Hetzner applies keys immediately - no restart needed!
+3. **Attach Key to Your Server** (keys are applied immediately)
 
-**C. Add Private Key to GitHub**
+**Add Private Key to GitHub:**
 
 1. **Copy the private key:**
    ```bash
    cat ~/.ssh/github_actions_deploy
-   # Copy the entire output (-----BEGIN OPENSSH PRIVATE KEY-----...)
+   # Copy the entire output
    ```
 
 2. **In GitHub Repository:**
@@ -677,9 +753,7 @@ ssh-keygen -t ed25519 -C "github-actions@brewapps" -f ~/.ssh/github_actions_depl
    - **Value:** Paste the private key
    - Click **"Add secret"**
 
-**D. Add Other Secrets**
-
-While you're there, add these:
+**Add Other Secrets:**
 
 ```
 Name: SERVER_IP
@@ -689,13 +763,7 @@ Name: SERVER_USER
 Value: deployer
 ```
 
-**Why This Method is Better:**
-
-- **No server file editing:** Hetzner manages the `authorized_keys` file automatically
-- **Easy to revoke:** Delete the key from Hetzner console if compromised
-- **Multiple keys:** You can have separate keys for different repos/apps
-- **Clean:** Keys are centralized in the Hetzner console
-- **No restart needed:** Keys are applied immediately
+**Note:** Use Method A (manual setup) if you're using the deployer user for deployments, as Hetzner Console only adds keys for root.
 
 ### Step 2: Create GitHub Actions Workflow
 
@@ -748,7 +816,7 @@ jobs:
     
     # Step 3: Setup SSH
     - name: Setup SSH
-      uses: webfactory/ssh-agent@v0.8.0
+      uses: webfactory/ssh-agent@v0.9.1
       with:
         ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
         
@@ -769,31 +837,31 @@ jobs:
         rsync -avz --delete \
           -e "ssh -i ~/.ssh/id_rsa" \
           ./ \
-          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/html/
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/prod/html/
         
         # Set correct permissions
         ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} \
-          'sudo chown -R deployer:deployer /var/www/brewapps/html && sudo chmod -R 755 /var/www/brewapps/html'
+          'sudo chown -R deployer:deployer /var/www/brewapps/prod/html && sudo chmod -R 755 /var/www/brewapps/prod/html'
         
         echo "Production deployment complete!"
         
-    # Step 6: Deploy to Development (dev branch)  
-    - name: Deploy to development
+    # Step 6: Deploy to Staging (dev branch)  
+    - name: Deploy to staging
       if: github.ref == 'refs/heads/dev'
       run: |
-        echo "Deploying to development..."
+        echo "Deploying to staging..."
         
         # For static HTML sites:
         rsync -avz --delete \
           -e "ssh -i ~/.ssh/id_rsa" \
           ./ \
-          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps-dev/html/
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/stage/html/
         
         # Set correct permissions
         ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} \
-          'sudo chown -R deployer:deployer /var/www/brewapps-dev/html && sudo chmod -R 755 /var/www/brewapps-dev/html'
+          'sudo chown -R deployer:deployer /var/www/brewapps/stage/html && sudo chmod -R 755 /var/www/brewapps/stage/html'
         
-        echo "Development deployment complete!"
+        echo "Staging deployment complete!"
 ```
 
 ### Build Steps Example (React/Next.js)
@@ -830,13 +898,13 @@ If you have a React or Next.js app that needs building:
         rsync -avz --delete \
           -e "ssh -i ~/.ssh/id_rsa" \
           ./out/ \
-          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/html/
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/prod/html/
         
         # For React (create-react-app): deploy the 'build' folder
         # rsync -avz --delete \
         #   -e "ssh -i ~/.ssh/id_rsa" \
         #   ./build/ \
-        #   ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/html/
+        #   ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }}:/var/www/brewapps/prod/html/
 ```
 
 ### Rollback to Specific Commit
@@ -894,7 +962,7 @@ git push origin hotfix-rollback
    - Wait for it to complete (green checkmark)
 
 4. **Verify deployment:**
-   - Visit https://dev.brewapps.poinglabs.com
+   - Visit https://stage.brewapps.poinglabs.com
    - Your changes should be live!
 
 5. **Test production:**
@@ -905,14 +973,38 @@ git push origin hotfix-rollback
    ```
    - Check https://brewapps.poinglabs.com
 
+### Verify Files on Server
+
+After deployment, SSH into your server to verify files were synced correctly:
+
+```bash
+# Check production files
+ls -la /var/www/brewapps/prod/html/
+
+# Check staging files
+ls -la /var/www/brewapps/stage/html/
+
+# View the index.html to confirm it's the latest version
+cat /var/www/brewapps/prod/html/index.html
+
+# Check file timestamps (should show recent time)
+stat /var/www/brewapps/prod/html/index.html
+```
+
+**Common checks:**
+- Files should have recent timestamps
+- Ownership should be `deployer:deployer`
+- Permissions should be `755` for directories, `644` for files
+- Content should match what you pushed to GitHub
+
 ### Complete Workflow Summary
 
 ```
 Developer workflow:
 ├── Work on feature locally
 ├── Push to dev branch
-├── GitHub Actions auto-deploys to dev.brewapps.poinglabs.com
-├── Test on dev site
+├── GitHub Actions auto-deploys to stage.brewapps.poinglabs.com
+├── Test on staging site
 ├── Merge dev → main
 ├── GitHub Actions auto-deploys to brewapps.poinglabs.com
 └── Production is updated!
@@ -924,20 +1016,20 @@ If you change domains later (e.g., from `brewapps.poinglabs.com` to `brewapps.co
 
 ```bash
 # 1. Update nginx configs - only change server_name
-sudo nano /etc/nginx/sites-available/brewapps
+sudo nano /etc/nginx/sites-available/brewapps-prod
 # Change: server_name brewapps.com;
 
-sudo nano /etc/nginx/sites-available/brewapps-dev
-# Change: server_name dev.brewapps.com;
+sudo nano /etc/nginx/sites-available/brewapps-stage
+# Change: server_name stage.brewapps.com;
 
 # 2. Get new SSL certificates
 sudo certbot --nginx -d brewapps.com
-sudo certbot --nginx -d dev.brewapps.com
+sudo certbot --nginx -d stage.brewapps.com
 
 # 3. Reload nginx
 sudo nginx -t && sudo systemctl reload nginx
 
-# Done! Your folders (/var/www/brewapps and /var/www/brewapps-dev) stay the same
+# Done! Your folders (/var/www/brewapps/prod and /var/www/brewapps/stage) stay the same
 ```
 
 **Why this is better:**
@@ -948,18 +1040,19 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ---
 
-## Hosting Static Websites (Generic Folder Approach)
+## Hosting Static Websites (Project-Based Folder Approach)
 
 ### Create Site Directory
 
-**Use generic project names, not domain names:**
+**Use project names with environment subfolders:**
 
 ```bash
-# Create directory for your site (use project name, not domain)
-sudo mkdir -p /var/www/my-project/html
+# Create project folder with prod and stage environments
+sudo mkdir -p /var/www/my-project/prod/html
+sudo mkdir -p /var/www/my-project/stage/html
 
 # Set correct ownership
-sudo chown -R $USER:$USER /var/www/my-project/html
+sudo chown -R deployer:deployer /var/www/my-project
 
 # Set correct permissions
 sudo chmod -R 755 /var/www/my-project
@@ -968,10 +1061,11 @@ sudo chmod -R 755 /var/www/my-project
 ### Create Nginx Config
 
 ```bash
-sudo nano /etc/nginx/sites-available/my-project
+# Production config
+sudo nano /etc/nginx/sites-available/my-project-prod
 ```
 
-Basic static site config:
+Production static site config:
 ```nginx
 server {
     listen 80;
@@ -980,8 +1074,35 @@ server {
     # Domain can change easily, folder stays the same
     server_name yourdomain.com www.yourdomain.com;
     
-    # Point to generic folder
-    root /var/www/my-project/html;
+    # Point to prod environment
+    root /var/www/my-project/prod/html;
+    index index.html index.htm;
+    
+    location / {
+        try_files $uri $uri/ =404;
+    }
+    
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+}
+```
+
+Staging config:
+```bash
+sudo nano /etc/nginx/sites-available/my-project-stage
+```
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    
+    server_name stage.yourdomain.com;
+    
+    # Point to stage environment
+    root /var/www/my-project/stage/html;
     index index.html index.htm;
     
     location / {
@@ -998,8 +1119,9 @@ server {
 ### Enable the Site
 
 ```bash
-# Create symlink to enable the site
-sudo ln -s /etc/nginx/sites-available/my-project /etc/nginx/sites-enabled/
+# Create symlinks to enable both environments
+sudo ln -s /etc/nginx/sites-available/my-project-prod /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/my-project-stage /etc/nginx/sites-enabled/
 
 # Test configuration
 sudo nginx -t
@@ -1008,14 +1130,33 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
+### Disable the Site
+
+```bash
+# Remove symlinks to disable sites
+sudo rm /etc/nginx/sites-enabled/my-project-prod
+sudo rm /etc/nginx/sites-enabled/my-project-stage
+
+# Test configuration
+sudo nginx -t
+
+# Reload nginx
+sudo systemctl reload nginx
+```
+
+**Note:** The config files in `sites-available/` remain - you can re-enable anytime by recreating the symlinks.
+
 ### Deploy Your Static Files
 
 ```bash
-# Example: copy your built site
-cp -r /path/to/your/dist/* /var/www/my-project/html/
+# Deploy to production
+cp -r /path/to/your/dist/* /var/www/my-project/prod/html/
 
-# Or if using the deployer user structure:
-# ln -s /home/deployer/apps/public/my-project/build /var/www/my-project/html
+# Deploy to staging
+cp -r /path/to/your/dist/* /var/www/my-project/stage/html/
+
+# Or using rsync for remote deployment:
+# rsync -avz --delete ./dist/ user@server:/var/www/my-project/prod/html/
 ```
 
 ### Why Generic Names?
@@ -1127,29 +1268,37 @@ server {
 
 ### Folder Structure
 
-Use **project names** instead of domain names for flexibility:
+Use **project names** with environment subfolders for better organization:
 
 ```
-/home/deployer/apps/
-├── public/
-│   ├── project-one/          # Next.js app (domain: projectone.com)
-│   ├── project-two/          # React app (domain: projecttwo.com)
-│   └── blog/                 # Static site (domain: blog.mysite.com)
-├── private/
-│   └── admin-tools/          # (domain: admin.mysite.com)
-└── n8n/
+/var/www/
+├── brewapps/                 # Project folder
+│   ├── prod/                # Production environment
+│   │   └── html/            # Production files
+│   └── stage/               # Staging environment
+│       └── html/            # Staging files
+├── project-one/             # Another project
+│   ├── prod/
+│   │   └── html/
+│   └── stage/
+│       └── html/
+└── blog/
+    ├── prod/
+    │   └── html/
+    └── stage/
+        └── html/
 ```
 
-### Example: Multiple Sites with Generic Folders
+### Example: Multiple Sites with Environment Subfolders
 
-**project-one** (Next.js on port 3000):
+**brewapps-prod** (Next.js on port 3000):
 ```nginx
 server {
     listen 443 ssl http2;
-    server_name projectone.com;
+    server_name brewapps.poinglabs.com;
     
-    ssl_certificate /etc/letsencrypt/live/projectone.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/projectone.com/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/brewapps.poinglabs.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/brewapps.poinglabs.com/privkey.pem;
     
     location / {
         proxy_pass http://localhost:3000;
@@ -1159,14 +1308,14 @@ server {
 }
 ```
 
-**project-two** (React on port 3001):
+**brewapps-stage** (Next.js on port 3001):
 ```nginx
 server {
     listen 443 ssl http2;
-    server_name projecttwo.com;
+    server_name stage.brewapps.poinglabs.com;
     
-    ssl_certificate /etc/letsencrypt/live/projecttwo.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/projecttwo.com/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/stage.brewapps.poinglabs.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/stage.brewapps.poinglabs.com/privkey.pem;
     
     location / {
         proxy_pass http://localhost:3001;
@@ -1176,7 +1325,7 @@ server {
 }
 ```
 
-**blog** (Static files):
+**blog-prod** (Static files):
 ```nginx
 server {
     listen 443 ssl http2;
@@ -1185,8 +1334,8 @@ server {
     ssl_certificate /etc/letsencrypt/live/blog.mysite.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/blog.mysite.com/privkey.pem;
     
-    # Points to generic folder
-    root /var/www/blog/html;
+    # Points to prod environment
+    root /var/www/blog/prod/html;
     index index.html;
     
     location / {
@@ -1198,15 +1347,33 @@ server {
 ### Enable All Sites
 
 ```bash
-# Create symlinks for all sites (use project names)
-sudo ln -s /etc/nginx/sites-available/project-one /etc/nginx/sites-enabled/
-sudo ln -s /etc/nginx/sites-available/project-two /etc/nginx/sites-enabled/
-sudo ln -s /etc/nginx/sites-available/blog /etc/nginx/sites-enabled/
+# Create symlinks for all sites (use project-environment naming)
+sudo ln -s /etc/nginx/sites-available/brewapps-prod /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/brewapps-stage /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/blog-prod /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/blog-stage /etc/nginx/sites-enabled/
 
 # Test and reload
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+### Disable All Sites (or Specific Ones)
+
+```bash
+# Disable specific sites
+sudo rm /etc/nginx/sites-enabled/brewapps-stage
+sudo rm /etc/nginx/sites-enabled/blog-stage
+
+# Disable all sites at once (careful!)
+# sudo rm /etc/nginx/sites-enabled/*
+
+# Test and reload
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+**Note:** Disabling sites only removes the symlinks in `sites-enabled/`. The actual configuration files remain safe in `sites-available/`.
 
 ---
 

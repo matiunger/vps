@@ -23,3 +23,26 @@ Host n8n
  - I may host n8n and want to access to webui.
 
 Host some scripts for example python scripts, node scripts, etc. and schedule them on a specific time.
+
+## To do's
+
+[x] poinglabs home
+[x] bailessons
+[x] brewapps
+
+[] finhub
+ - [] asset manager
+ - [] asset scraping
+ - [] asset alerts
+ - [] dashboard
+
+
+[] brewhub
+
+[] script - lista verduleria
+
+[] tubirra
+[] tubirra evaluation form
+
+[] deltalevels
+[] deltalevels pro
